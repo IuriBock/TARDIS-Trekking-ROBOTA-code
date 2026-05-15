@@ -6,10 +6,11 @@ import time
 # --- CONFIGURAÇÃO ---
 PORTA_SERIAL = '/dev/ttyAMA2'
 PINO_MOTOR = PwmChannel.Ch4          # Pino PWM da Navigator onde o motor está ligado
-TARGET_RPM = 300        # Rotação ideal
+TARGET_RPM = 280        # Rotação ideal
 PWM_MIN = 0.0           # 0%
-PWM_MAX = 0.5           # 80% (limite de segurança)
+PWM_MAX = 0.5           # 50% (limite de segurança)
 K_P = 0.01            # Ganho do controle (ajuste se oscilar muito)
+K_I = K_P/100        # Ganho integral (ajuste para eliminar erro estacionário)
 
 navigator.init() # Inicia navigator
 navigator.set_pwm_freq_hz(50)
@@ -19,8 +20,9 @@ time.sleep(0.5)
 
 
 def main():
-    pwm_atual = 0.3 # Começa com 40% de força
-    
+    pwm_atual = 0.5 # Começa com 50% de força
+    erro_integral = 0    # Acumulador para o termo integral
+
     try:
         ser = serial.Serial(PORTA_SERIAL, 115200, timeout=1)
         print(f"Estabilizando motor em {TARGET_RPM} RPM...")
@@ -40,7 +42,10 @@ def main():
                 
                 # --- Lógica de Controle (P) ---
                 erro = TARGET_RPM - rpm_atual
-                pwm_atual = erro * K_P
+                erro_integral += erro  # Acumula o erro para o termo integral
+                up = erro * K_P
+                ui = erro_integral * K_I
+                pwm_atual = up + ui
                 
                 # Limita o PWM para não queimar o motor ou travar
                 pwm_atual = max(PWM_MIN, min(PWM_MAX, pwm_atual))

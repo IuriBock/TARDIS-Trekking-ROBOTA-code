@@ -15,9 +15,11 @@ from data_structures import SensorData, RobotState, TrajectoryPoint
 from pid_controller import PIDController
 from ackermann_model import AckermannModel
 from sensor_fusion import SensorFusion
+from lidar_driver import LidarDriver
 
 import bluerobotics_navigator as navigator
 from bluerobotics_navigator import PwmChannel, UserLed
+
 
 # Adiciona o diretório atual ao path para importar o servidor
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +41,10 @@ class AckermannControlSystem:
         Args:
             simulation_mode: Se True, usa modelo cinemático em vez de sensores reais
         """
+
+        # Inicializa o LIDAR Driver
+        self.lidar = LidarDriver() if not simulation_mode else None
+        
         self.motor_pin = PwmChannel.Ch2 # Canal PWM para o motor (ajuste conforme seu hardware)
         self.servo_pin = PwmChannel.Ch1  # Canal PWM para o servo de direção (ajuste conforme seu hardware)
         self.led_pin = PwmChannel.Ch3    # Canal PWM para LED de emergência (opcional)
@@ -144,6 +150,42 @@ class AckermannControlSystem:
         
         self.current_waypoint_index = 0
         print(f"[Trajetória] Carregados {len(self.trajectory)} pontos")
+
+    def calculate_obstacle_avoidance(self, steering_pid, speed_pid):
+        """
+        Lógica de Desvio: Analisa o cone frontal (300° a 60°)
+        e sobrescreve o comando do PID se necessário.
+        """
+        if not self.lidar: return steering_pid, speed_pid
+        
+        scan = self.lidar.pegar_distancias()
+        dist_minima = 300 # 60cm para começar a desviar
+        parada_critica = 200 # 30cm para parar tudo
+        
+        # Verifica cone frontal
+        bloqueio_esquerda = False
+        bloqueio_direita = False
+        
+        # Analisa de 300 a 360 (Direita frontal) e 0 a 60 (Esquerda frontal)
+        for ang in range(300, 360):
+            if 0 < scan[ang] < dist_minima: bloqueio_direita = True
+            if 0 < scan[ang] < parada_critica: return 0.0, 0.0 # Emergência
+            
+        for ang in range(0, 61):
+            if 0 < scan[ang] < dist_minima: bloqueio_esquerda = True
+            if 0 < scan[ang] < parada_critica: return 0.0, 0.0 # Emergência
+
+        # Ajuste reativo
+        if bloqueio_esquerda and bloqueio_direita:
+            return steering_pid, speed_pid * 0.2 # Caminho estreito, vai devagar
+        elif bloqueio_esquerda:
+            #print("[REFLEXO] Obstáculo na esquerda! Virando para direita.")
+            return 0.8, speed_pid * 0.5 # Força curva à direita
+        elif bloqueio_direita:
+            #print("[REFLEXO] Obstáculo na direita! Virando para esquerda.")
+            return -0.8, speed_pid * 0.5 # Força curva à esquerda
+            
+        return steering_pid, speed_pid
     
     def calculate_steering_control(self, target_point: TrajectoryPoint) -> float:
         """
@@ -327,7 +369,24 @@ class AckermannControlSystem:
                 # Taxa de atualização do controle (100 Hz)
                 current_time = time.time()
                 dt = current_time - last_control_time
+                # Pega as distâncias sem parar o código (é instantâneo)
+                distancias = self.lidar.pegar_distancias()
                 
+                # Lógica de desvio (Exemplo: 300° a 60°)
+                obstaculo_perto = False
+                for angulo in range(300, 360): # Lado direito frontal
+                    if 0 < distancias[angulo] < 500: # 50cm
+                        obstaculo_perto = True
+                for angulo in range(0, 61):    # Lado esquerdo frontal
+                    if 0 < distancias[angulo] < 500:
+                        obstaculo_perto = True
+
+                # Se houver obstáculo, você altera o steering_cmd que o PID calculou
+                if obstaculo_perto:
+                    continue
+                    #print("Obstáculo detectado! Desviando...")
+                    # Aqui você força o servo a virar, ignorando o trajeto por um momento
+
                 if dt < 0.01:  # 10 ms
                     time.sleep(0.01 - dt)
                     continue
@@ -343,6 +402,9 @@ class AckermannControlSystem:
                 # Cálculo dos comandos de controle
                 steering_cmd = self.calculate_steering_control(target_point)
                 speed_cmd = self.calculate_speed_control(target_point)
+
+                # Camada de Segurança (LIDAR) - Ela "limpa" os comandos acima
+                steering_cmd, speed_cmd = self.calculate_obstacle_avoidance(steering_cmd, speed_cmd)
                 
                 # Aplica os comandos aos atuadores
                 self.apply_control(steering_cmd, speed_cmd)
@@ -449,6 +511,7 @@ class AckermannControlSystem:
         print(f"[COMANDOS] Ângulo: {math.degrees(steering_angle):.1f}° -> Duty={duty*100:.1f}% | "
             f"Velocidade: {speed_cmd*100:.1f}% -> Duty={motor_duty*100:.1f}%, {direcao}")
         '''
+        
     def start(self):
         """Inicia o sistema de controle"""
         if self.running:
@@ -458,6 +521,9 @@ class AckermannControlSystem:
         if not self.trajectory:
             print("Erro: Trajetória não definida")
             return
+        
+        if self.lidar:
+            self.lidar.iniciar()
         
         self.running = True
         navigator.set_pwm_channel_duty_cycle(self.led_pin, 0.0)
@@ -480,7 +546,7 @@ class AckermannControlSystem:
     def stop(self):
         """Para o sistema de controle"""
         self.running = False
-
+        self.lidar.parar()
         navigator.set_pwm_channel_duty_cycle(self.motor_pin, 0.0)  # para motores
         # ADAPTAÇÃO: Parar motores e centralizar direção
         print("Parando sistema de controle...")
@@ -498,6 +564,7 @@ class AckermannControlSystem:
         """Parada de emergência - para imediatamente todos os motores"""
         self.running = False
         self.control_thread = None
+        self.lidar.parar()
         navigator.set_pwm_channel_duty_cycle(self.motor_pin, 0.0)  # para motores
         navigator.set_pwm_channel_duty_cycle(self.led_pin, 1.0)  # Acende LED de emergência (se disponível)
         # ADAPTAÇÃO: Comando de parada de emergência para seus atuadores
